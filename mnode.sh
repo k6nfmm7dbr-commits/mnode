@@ -130,7 +130,7 @@ core_install() {
   ok "内核: $("$CORE" -v 2>/dev/null | head -n1)"
 }
 
-core_ver() { "$CORE" -v 2>/dev/null | awk '{print $3}'; }
+core_ver() { "$CORE" -v 2>/dev/null | head -n1 | awk '{print $3}'; }
 
 # =============================================================================
 #  地址族探测：有公网 IPv6 才输出 v6 链接
