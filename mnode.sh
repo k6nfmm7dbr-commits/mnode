@@ -17,6 +17,8 @@ set -o pipefail
 readonly VERSION="1.0.0"
 readonly CORE_REPO="MetaCubeX/mihomo"
 readonly CORE_FALLBACK="v1.19.30"
+# 通过 bash <(curl ...) 运行时 $0 是已读完的管道，自安装要回退到从这里下载
+readonly SELF_URL="${MNODE_SELF_URL:-https://raw.githubusercontent.com/k6nfmm7dbr-commits/mnode/main/mnode.sh}"
 
 # ---- 路径（可用环境变量覆盖，便于沙箱测试）----------------------------------
 ROOT="${MNODE_ROOT:-/etc/mnode}"
@@ -970,15 +972,35 @@ ${W}mnode v${VERSION}${N} — mihomo 节点搭建 / 删除 / 改端口 / 改 SNI
 EOF
 }
 
+# 把自己装成 /usr/local/bin/mnode
+#   直接执行脚本文件 → 复制 $0
+#   bash <(curl ...) / 管道执行 → $0 是不可复用的 fd，改为从 SELF_URL 重新下载
+self_install() {
+  [ "${MNODE_NO_SELFCOPY:-0}" = 1 ] && return 0
+  [ "$0" = "$SELF" ] && return 0
+  if [ -f "$0" ] && head -n1 "$0" 2>/dev/null | grep -q '^#!'; then
+    cat "$0" > "$SELF" 2>/dev/null && chmod +x "$SELF" && { ok "已安装命令: mnode"; return 0; }
+  fi
+  local tmp; tmp="$(mktemp)"
+  if curl -fsSL --retry 2 --max-time 30 -o "$tmp" "$SELF_URL" 2>/dev/null \
+     || curl -fsSL --retry 1 --max-time 30 -o "$tmp" "https://ghfast.top/$SELF_URL" 2>/dev/null; then
+    if head -n1 "$tmp" | grep -q '^#!' && bash -n "$tmp" 2>/dev/null; then
+      cat "$tmp" > "$SELF" && chmod +x "$SELF" && ok "已安装命令: mnode"
+      rm -f "$tmp"; return 0
+    fi
+  fi
+  rm -f "$tmp"
+  warn "未能自动安装 mnode 命令，可手动下载: curl -fsSLo $SELF $SELF_URL && chmod +x $SELF"
+  return 0
+}
+
 bootstrap() {
   need_root
   ensure_deps
   mkdir -p "$ROOT" "$NODES"
   chmod 700 "$ROOT"
   core_install 0
-  if [ "$0" != "$SELF" ] && [ "${MNODE_NO_SELFCOPY:-0}" != 1 ] && [ -f "$0" ]; then
-    cat "$0" > "$SELF" 2>/dev/null && chmod +x "$SELF" && ok "已安装命令: mnode"
-  fi
+  self_install
   svc_install
   [ -s "$ROOT/.ip4" ] || detect_addrs 0
   [ -f "$CONF" ] || build_conf
@@ -991,7 +1013,8 @@ main() {
     -v|--version|version) printf 'mnode %s\n' "$VERSION"; return 0 ;;
   esac
   need_root
-  [ -x "$CORE" ] || bootstrap
+  # 内核或 mnode 命令任一缺失都要走一次 bootstrap
+  { [ -x "$CORE" ] && [ -x "$SELF" ]; } || bootstrap
   local cmd="$1"; shift
   case "$cmd" in
     add)  [ $# -ge 1 ] || { err "用法: mnode add <协议> [端口] [SNI]"; return 1; }
