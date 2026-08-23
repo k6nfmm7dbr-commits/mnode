@@ -1348,7 +1348,10 @@ menu() {
     printf '  7) 重启服务   8) 查看日志   9) 更新内核\n'
     printf ' 10) 重新探测IP 11) 卸载      0) 退出\n'
     printf '\n选择: '
-    local c; read -r c; printf '\n'
+    local c
+    # stdin 已关闭（管道喂完 / Ctrl-D）时必须退出，否则 read 立即返回空值造成死循环
+    read -r c || { printf '\n'; exit 0; }
+    printf '\n'
     case "$c" in
       1) ui_add ;;
       2) ui_del ;;
@@ -1364,7 +1367,8 @@ menu() {
       0|q|Q) exit 0 ;;
       *) err "无效选择" ;;
     esac
-    printf '\n%s按回车继续…%s' "$D" "$N"; read -r _
+    printf '\n%s按回车继续…%s' "$D" "$N"
+    read -r _ || { printf '\n'; exit 0; }
   done
 }
 
