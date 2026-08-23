@@ -33,6 +33,21 @@ SVC_FILE="/etc/systemd/system/${SVC}.service"
 API_PORT="${MNODE_API_PORT:-19090}"
 NO_SVC="${MNODE_NO_SERVICE:-0}"
 
+# ---- 流量面板（复用 sbx 项目的 panel.py，未做任何改动）----------------------
+PANEL_DIR="$ROOT/panel"
+PANEL_PY="$PANEL_DIR/panel.py"
+PANEL_CONF="$PANEL_DIR/panel.json"
+PANEL_NODES="$PANEL_DIR/nodes.json"
+PANEL_WEB="$PANEL_DIR/web"
+PANEL_SVC="mnode-panel"
+FW_SVC="mnode-firewall"
+PANEL_SVC_FILE="/etc/systemd/system/${PANEL_SVC}.service"
+FW_SVC_FILE="/etc/systemd/system/${FW_SVC}.service"
+# panel.py 用这两个变量定位自己的目录与配置（它的默认值是 /etc/sbx）
+export SBX_DIR="$PANEL_DIR"
+export SBX_CONF="$PANEL_CONF"
+
+
 # ---- 颜色 -------------------------------------------------------------------
 if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
   R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[36m'
@@ -73,6 +88,7 @@ ensure_deps() {
   has curl    || need="$need curl"
   has openssl || need="$need openssl"
   has gzip    || need="$need gzip"
+  has python3 || need="$need python3"
   if [ -n "$need" ]; then
     info "安装依赖:$need"
     pkg_install $need || warn "依赖自动安装失败，请手动安装:$need"
@@ -80,6 +96,13 @@ ensure_deps() {
   has curl    || die "缺少 curl"
   has openssl || die "缺少 openssl"
   has gzip    || die "缺少 gzip"
+  has python3 || die "缺少 python3（流量面板依赖）"
+  # 计数后端：面板的流量统计依赖 nftables 或 iptables
+  if ! has nft && ! has iptables; then
+    info "安装计数后端 nftables"
+    pkg_install nftables || pkg_install iptables \
+      || warn "未能安装 nftables/iptables，流量统计将不可用"
+  fi
   # 可选：二维码
   has qrencode || pkg_install qrencode >/dev/null 2>&1 || true
 }
@@ -131,6 +154,64 @@ core_install() {
 }
 
 core_ver() { "$CORE" -v 2>/dev/null | head -n1 | awk '{print $3}'; }
+
+# ---- 流量面板资源安装 -------------------------------------------------------
+# panel.py 与 web/ 原样取自 sbx 项目，和 mnode.sh 放在同一个仓库同一分支，
+# 因此与脚本自身版本天然同步。
+panel_base_url() {
+  # 由 SELF_URL 推出同目录 base：.../main/mnode.sh -> .../main
+  printf '%s' "${MNODE_PANEL_BASE:-${SELF_URL%/*}}"
+}
+
+_fetch_to() {   # _fetch_to <url> <dest>
+  local url="$1" dst="$2" tmp
+  tmp="$(mktemp)"
+  if curl -fsSL --retry 2 --max-time 40 -o "$tmp" "$url" 2>/dev/null \
+     || curl -fsSL --retry 1 --max-time 40 -o "$tmp" "https://ghfast.top/$url" 2>/dev/null; then
+    if [ -s "$tmp" ]; then
+      cat "$tmp" > "$dst"; rm -f "$tmp"; return 0
+    fi
+  fi
+  rm -f "$tmp"; return 1
+}
+
+panel_install() {
+  local force="${1:-0}"
+  has python3 || { warn "没有 python3，跳过流量面板"; return 1; }
+  if panel_installed && [ "$force" != 1 ]; then return 0; fi
+  local base stage
+  base="$(panel_base_url)"
+  stage="$(mktemp -d)"
+
+  # 先全部下到暂存目录并校验，成功后才覆盖现有文件。
+  # 这样更新失败不会破坏已经能用的面板。
+  if ! _fetch_to "$base/src/panel.py" "$stage/panel.py" \
+     || ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$stage/panel.py" 2>/dev/null; then
+    rm -rf "$stage"
+    if panel_installed; then warn "面板资源下载失败，保留现有版本"
+    else warn "面板资源下载失败，已跳过面板（节点功能不受影响）"; fi
+    return 1
+  fi
+  local f
+  for f in index.html login.html app.js style.css; do
+    if ! _fetch_to "$base/web/$f" "$stage/$f"; then
+      rm -rf "$stage"
+      if panel_installed; then warn "面板资源下载不完整，保留现有版本"
+      else warn "面板资源下载不完整，已跳过面板（节点功能不受影响）"; fi
+      return 1
+    fi
+  done
+
+  mkdir -p "$PANEL_DIR" "$PANEL_WEB"
+  cat "$stage/panel.py" > "$PANEL_PY"; chmod 755 "$PANEL_PY"
+  for f in index.html login.html app.js style.css; do
+    cat "$stage/$f" > "$PANEL_WEB/$f"; chmod 644 "$PANEL_WEB/$f"
+  done
+  rm -rf "$stage"
+  ok "流量面板资源就绪"
+  return 0
+}
+
 
 # =============================================================================
 #  地址族探测：有公网 IPv6 才输出 v6 链接
@@ -346,6 +427,40 @@ proto_sni() {
   case "$1" in vless-reality|vless-ws) return 0 ;; *) return 1 ;; esac
 }
 
+# 面板 nodes.json 里的 type（沿用 sbx 的协议名，决定连接数按 TCP 还是 UDP 统计）
+panel_type() {
+  case "$1" in
+    vless-reality|vless-ws) echo "vless" ;;
+    ss2022)                 echo "shadowsocks" ;;
+    *)                      echo "$1" ;;
+  esac
+}
+
+# 面板 nodes.json 里的 net（限定计流量的传输层；留空=tcp+udp 都计）
+panel_net() {
+  case "$1" in
+    vless-reality|vless-ws) echo "tcp" ;;   # VLESS 只监听 TCP
+    *)                      echo "" ;;      # ss2022 同时收 TCP/UDP
+  esac
+}
+
+# 面板计数器名要求节点 id 是整数（panel.py 的 sbx_n<数字>_i）。
+# 每个节点分配一个永不复用的数字 pid，删除节点后不回收，历史统计不会串到新节点上。
+panel_pid() {
+  local id="$1" pid
+  pid="$(nget "$id" pid)"
+  if [ -z "$pid" ]; then
+    local seq="$ROOT/.pidseq" last=0
+    [ -s "$seq" ] && last="$(cat "$seq")"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    pid=$((last + 1))
+    printf '%s' "$pid" > "$seq"
+    nset "$id" pid "$pid"
+  fi
+  printf '%s' "$pid"
+}
+
+
 # =============================================================================
 #  渲染 mihomo 配置
 # =============================================================================
@@ -527,7 +642,10 @@ apply() {
   fi
   [ -n "$bak" ] && rm -f "$bak"
   if [ "$(node_n)" = 0 ]; then
-    svc_stop; ok "已无节点，服务已停止"; return 0
+    svc_stop
+    panel_refresh          # 节点清零也要同步面板，避免残留计数规则
+    ok "已无节点，服务已停止"
+    return 0
   fi
   svc_start
   local i=0
@@ -556,6 +674,255 @@ apply() {
     svc_log 20 | grep -iE 'listen err|bind' >&2
     return 1
   fi
+  panel_refresh            # 端口/节点变了，面板计数规则要跟着换代
+  return 0
+}
+
+# =============================================================================
+#  流量面板（直接复用 sbx 项目的 panel.py / web，未改一行）
+#
+#  panel.py 只认一个输入：nodes.json —— [{"id":整数,"name":..,"type":..,
+#  "port":..,"net":..}]。mnode 每次改动节点后把自己的 .node 文件同步成这个
+#  格式，然后让 panel.py 按新端口重建 netfilter 计数规则。
+# =============================================================================
+panel_installed() { [ -f "$PANEL_PY" ]; }
+
+# 把 mnode 的节点导出成面板要的 nodes.json（原子写）
+panel_sync_nodes() {
+  panel_installed || return 0
+  mkdir -p "$PANEL_DIR"
+  local t; t="$(mktemp)"
+  {
+    printf '['
+    local first=1 id
+    for id in $(node_ids); do
+      [ "$first" = 1 ] || printf ','
+      first=0
+      printf '\n  {"id": %s, "name": "%s", "type": "%s", "port": %s' \
+        "$(panel_pid "$id")" "$id" "$(panel_type "$(nget "$id" proto)")" "$(nget "$id" port)"
+      local net; net="$(panel_net "$(nget "$id" proto)")"
+      [ -n "$net" ] && printf ', "net": "%s"' "$net"
+      printf '}'
+    done
+    [ "$first" = 1 ] || printf '\n'
+    printf ']\n'
+  } > "$t"
+  # 落盘前先用 python 校验一次 JSON，避免把坏文件喂给面板
+  if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$t" 2>/dev/null; then
+    cat "$t" > "$PANEL_NODES"
+  else
+    warn "面板节点表生成异常，已保留旧文件"
+  fi
+  rm -f "$t"
+  return 0
+}
+
+panel_get() {
+  panel_installed || return 1
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' \
+    "$PANEL_CONF" "$1" 2>/dev/null
+}
+
+panel_set() {
+  panel_installed || return 1
+  python3 - "$PANEL_CONF" "$1" "$2" <<'PY' 2>/dev/null
+import json, os, sys
+p, k, v = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(p))
+try: v = int(v)
+except ValueError: pass
+d[k] = v
+t = p + ".tmp"
+json.dump(d, open(t, "w"), indent=2, ensure_ascii=False)
+os.replace(t, p); os.chmod(p, 0o600)
+PY
+}
+
+# 首次生成 panel.json（端口随机，令牌随机）；已存在则只补令牌
+panel_ensure_conf() {
+  mkdir -p "$PANEL_DIR" "$PANEL_WEB"
+  if [ -f "$PANEL_CONF" ]; then
+    # 补齐访问令牌与内核 API 地址（老版本升级过来时缺这两项）
+    python3 - "$PANEL_CONF" "http://127.0.0.1:$API_PORT" <<'PY' 2>/dev/null
+import json, os, secrets, sys
+p, api = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+changed = False
+if not d.get("token"):
+    d["token"] = secrets.token_hex(16); changed = True
+if "core_api" not in d:
+    d["core_api"] = api; changed = True
+if "core_secret" not in d:
+    d["core_secret"] = ""; changed = True
+if changed:
+    t = p + ".tmp"
+    json.dump(d, open(t, "w"), indent=2, ensure_ascii=False)
+    os.replace(t, p); os.chmod(p, 0o600)
+PY
+    return 0
+  fi
+  local port token
+  port="$(free_port)"
+  token="$(gen_hex 16)"
+  cat > "$PANEL_CONF" <<EOF
+{
+  "db": "$PANEL_DIR/traffic.db",
+  "nodes_file": "$PANEL_NODES",
+  "nft_conf": "$PANEL_DIR/nft.conf",
+  "ipt_script": "$PANEL_DIR/iptables.sh",
+  "web_root": "$PANEL_WEB",
+  "backend": "auto",
+  "listen": "0.0.0.0",
+  "port": $port,
+  "token": "$token",
+  "interval": 2,
+  "tz": "Asia/Shanghai",
+  "core_api": "http://127.0.0.1:$API_PORT",
+  "core_secret": ""
+}
+EOF
+  chmod 600 "$PANEL_CONF"
+  ok "流量面板端口 $port"
+}
+
+# 重建 netfilter 计数规则（换代标记让累计流量无缝衔接）
+panel_fw_apply() {
+  panel_installed || return 0
+  python3 "$PANEL_PY" apply >/dev/null 2>&1 || {
+    warn "流量计数规则应用失败，面板数字可能不更新"
+    return 1
+  }
+  return 0
+}
+
+panel_svc_install() {
+  panel_installed || return 0
+  use_systemd || return 0
+  local t; t="$(mktemp)"
+  cat > "$t" <<EOF
+[Unit]
+Description=mnode traffic counters (netfilter)
+After=network-pre.target
+Before=${SVC}.service ${PANEL_SVC}.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=SBX_DIR=$PANEL_DIR
+Environment=SBX_CONF=$PANEL_CONF
+ExecStart=$(command -v python3) $PANEL_PY apply
+ExecStop=$(command -v python3) $PANEL_PY clear
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cmp -s "$t" "$FW_SVC_FILE" 2>/dev/null || { cat "$t" > "$FW_SVC_FILE"; NEED_RELOAD=1; }
+
+  cat > "$t" <<EOF
+[Unit]
+Description=mnode traffic panel
+After=network-online.target ${FW_SVC}.service
+Wants=network-online.target ${FW_SVC}.service
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+Environment=SBX_DIR=$PANEL_DIR
+Environment=SBX_CONF=$PANEL_CONF
+ExecStart=$(command -v python3) $PANEL_PY serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cmp -s "$t" "$PANEL_SVC_FILE" 2>/dev/null || { cat "$t" > "$PANEL_SVC_FILE"; NEED_RELOAD=1; }
+  rm -f "$t"
+  if [ "${NEED_RELOAD:-0}" = 1 ]; then
+    systemctl daemon-reload >/dev/null 2>&1
+    NEED_RELOAD=0
+  fi
+  systemctl enable "$FW_SVC" "$PANEL_SVC" >/dev/null 2>&1
+  return 0
+}
+
+panel_start() {
+  panel_installed || return 0
+  if use_systemd; then
+    panel_svc_install
+    systemctl reset-failed "$PANEL_SVC" >/dev/null 2>&1
+    systemctl restart "$PANEL_SVC" >/dev/null 2>&1
+  else
+    panel_stop
+    SBX_DIR="$PANEL_DIR" SBX_CONF="$PANEL_CONF" \
+      nohup python3 "$PANEL_PY" serve > "$PANEL_DIR/panel.log" 2>&1 &
+    echo $! > "$PANEL_DIR/panel.pid"
+  fi
+  return 0
+}
+
+panel_stop() {
+  if use_systemd; then systemctl stop "$PANEL_SVC" >/dev/null 2>&1
+  else
+    [ -f "$PANEL_DIR/panel.pid" ] && kill "$(cat "$PANEL_DIR/panel.pid")" >/dev/null 2>&1
+    rm -f "$PANEL_DIR/panel.pid"
+  fi
+  return 0
+}
+
+panel_up() {
+  panel_installed || return 1
+  if use_systemd; then systemctl is-active --quiet "$PANEL_SVC"
+  else [ -f "$PANEL_DIR/panel.pid" ] && kill -0 "$(cat "$PANEL_DIR/panel.pid")" >/dev/null 2>&1; fi
+}
+
+panel_state() {
+  if ! panel_installed; then printf '%s' "${D}未安装${N}"
+  elif panel_up; then printf '%s' "${G}运行中${N}"
+  else printf '%s' "${R}已停止${N}"; fi
+}
+
+panel_log() {
+  if use_systemd; then journalctl -u "$PANEL_SVC" -n "${1:-40}" --no-pager 2>/dev/null
+  else tail -n "${1:-40}" "$PANEL_DIR/panel.log" 2>/dev/null; fi
+}
+
+panel_url() {
+  panel_installed || return 1
+  local p t h
+  p="$(panel_get port)"; t="$(panel_get token)"
+  h="$(addr4)"; [ -n "$h" ] || h="127.0.0.1"
+  [ "$(panel_get listen)" = "127.0.0.1" ] && h="127.0.0.1"
+  printf 'http://%s:%s/?token=%s\n' "$(url_host "$h")" "$p" "$t"
+}
+
+panel_info() {
+  line
+  printf '%s流量面板%s\n' "$W" "$N"
+  if ! panel_installed; then
+    printf '  %s未安装（缺少 python3 或安装时下载失败）%s\n' "$D" "$N"
+    line; return 0
+  fi
+  printf '  地址  : %s%s%s\n' "$B" "$(panel_url)" "$N"
+  printf '  状态  : %s\n' "$(panel_state)"
+  printf '  监听  : %s:%s\n' "$(panel_get listen)" "$(panel_get port)"
+  printf '  后端  : %s\n' "$(has nft && echo nftables || echo iptables)"
+  printf '  采集  : 每 %s 秒\n' "$(panel_get interval)"
+  line
+  return 0
+}
+
+# 节点有任何变动后：同步节点表 → 重建计数规则 → 重启面板
+panel_refresh() {
+  panel_installed || return 0
+  panel_sync_nodes
+  panel_fw_apply
+  panel_start
   return 0
 }
 
@@ -828,10 +1195,13 @@ head_ui() {
   printf '  内核 %s  服务 %s  节点 %s%s%s\n' \
     "$(core_ver)" "$(svc_state)" "$W" "$(node_n)" "$N"
   if has_v6; then
-    printf '  IPv4 %s   IPv6 %s%s%s\n\n' "$(addr4)" "$G" "$(addr6)" "$N"
+    printf '  IPv4 %s   IPv6 %s%s%s\n' "$(addr4)" "$G" "$(addr6)" "$N"
   else
-    printf '  IPv4 %s   IPv6 %s无%s\n\n' "$(addr4)" "$D" "$N"
+    printf '  IPv4 %s   IPv6 %s无%s\n' "$(addr4)" "$D" "$N"
   fi
+  printf '  面板 %s' "$(panel_state)"
+  panel_installed && printf '  %shttp://%s:%s%s' "$D" "$(addr4)" "$(panel_get port)" "$N"
+  printf '\n\n'
 }
 
 ui_add() {
@@ -892,16 +1262,76 @@ ui_show() {
   sub_b64
 }
 
+# ---- 流量面板菜单 -----------------------------------------------------------
+ui_panel() {
+  if ! panel_installed; then
+    warn "流量面板未安装"
+    printf '现在安装？[y/N]: '; local a; read -r a
+    case "$a" in
+      y|Y|yes|YES) panel_install 1 && { panel_ensure_conf; panel_refresh; ok "面板已启动"; } ;;
+      *) info "已取消" ;;
+    esac
+    return 0
+  fi
+  panel_info
+  printf '  1) 查看统计（终端）      2) 最近 14 天\n'
+  printf '  3) 修改面板端口          4) 修改采集间隔\n'
+  printf '  5) 切换 仅本机/公网访问  6) 重置访问令牌\n'
+  printf '  7) 统计自检              8) 面板日志\n'
+  printf '  9) 重建计数规则         10) 清空统计数据\n'
+  printf '  0) 返回\n'
+  printf '选择: '; local c; read -r c; printf '\n'
+  case "$c" in
+    1) line; python3 "$PANEL_PY" show; line ;;
+    2) line; python3 "$PANEL_PY" daily 14; line ;;
+    3) printf '新端口: '; local p; read -r p
+       if valid_port "$p" && ! port_used "$p"; then
+         fw_close "$(panel_get port)"; panel_set port "$p"; fw_open "$p"
+         panel_start; ok "面板端口已改为 $p"; panel_info
+       else err "端口无效或已被占用"; fi ;;
+    4) printf '采集间隔秒数 (1-60): '; local n; read -r n
+       case "$n" in ''|*[!0-9]*) err "无效数值" ;; *)
+         if [ "$n" -ge 1 ] && [ "$n" -le 60 ]; then
+           panel_set interval "$n"; panel_start; ok "采集间隔已改为 ${n}s"
+         else err "范围应为 1-60"; fi ;;
+       esac ;;
+    5) if [ "$(panel_get listen)" = "127.0.0.1" ]; then
+         panel_set listen "0.0.0.0"; fw_open "$(panel_get port)"; ok "已允许公网访问"
+       else
+         panel_set listen "127.0.0.1"; fw_close "$(panel_get port)"; ok "已限制为仅本机访问"
+       fi
+       panel_start; panel_info ;;
+    6) panel_set token "$(gen_hex 16)"; panel_start; ok "令牌已重置"; panel_info ;;
+    7) line; python3 "$PANEL_PY" selftest; line ;;
+    8) panel_log 40 ;;
+    9) panel_refresh && ok "计数规则已重建" ;;
+    10) printf '%s确认清空全部流量统计？不可恢复 [y/N]: %s' "$Y" "$N"
+        local yn; read -r yn
+        case "$yn" in
+          y|Y|yes|YES) python3 "$PANEL_PY" reset >/dev/null 2>&1; panel_start; ok "统计已清空" ;;
+          *) info "已取消" ;;
+        esac ;;
+    0|'') return 0 ;;
+    *) err "无效选择" ;;
+  esac
+  return 0
+}
+
 ui_uninstall() {
-  printf '%s将删除内核、所有节点与配置，确认卸载？[y/N]: %s' "$R" "$N"
+  printf '%s将删除内核、所有节点、流量面板与统计数据，确认卸载？[y/N]: %s' "$R" "$N"
   local a; read -r a
   case "$a" in y|Y|yes|YES) ;; *) info "已取消"; return 0 ;; esac
   local id
   for id in $(node_ids); do fw_close "$(nget "$id" port)"; done
+  panel_installed && fw_close "$(panel_get port)" 2>/dev/null
+  # 先撤掉 netfilter 计数规则，别在系统里留残留
+  panel_installed && python3 "$PANEL_PY" clear >/dev/null 2>&1
+  panel_stop
   svc_stop
   if use_systemd; then
-    systemctl disable "$SVC" >/dev/null 2>&1
-    rm -f "$SVC_FILE"; systemctl daemon-reload >/dev/null 2>&1
+    systemctl disable "$SVC" "$PANEL_SVC" "$FW_SVC" >/dev/null 2>&1
+    rm -f "$SVC_FILE" "$PANEL_SVC_FILE" "$FW_SVC_FILE"
+    systemctl daemon-reload >/dev/null 2>&1
   fi
   rm -rf "$ROOT"; rm -f "$CORE" "$SELF"
   ok "已卸载干净"
@@ -913,10 +1343,10 @@ menu() {
     head_ui
     printf '  1) 搭建节点        2) 删除节点\n'
     printf '  3) 修改端口        4) 修改 SNI\n'
-    printf '  5) 查看节点/订阅\n'
+    printf '  5) 查看节点/订阅   6) 流量面板\n'
     line
-    printf '  6) 重启服务   7) 查看日志   8) 更新内核\n'
-    printf '  9) 重新探测IP 10) 卸载      0) 退出\n'
+    printf '  7) 重启服务   8) 查看日志   9) 更新内核\n'
+    printf ' 10) 重新探测IP 11) 卸载      0) 退出\n'
     printf '\n选择: '
     local c; read -r c; printf '\n'
     case "$c" in
@@ -925,11 +1355,12 @@ menu() {
       3) ui_port ;;
       4) ui_sni ;;
       5) ui_show ;;
-      6) apply && ok "服务已重启" ;;
-      7) svc_log 40 ;;
-      8) core_install 1 && apply && ok "内核已更新" ;;
-      9) detect_addrs 0 ;;
-      10) ui_uninstall ;;
+      6) ui_panel ;;
+      7) apply && ok "服务已重启" ;;
+      8) svc_log 40 ;;
+      9) core_install 1 && panel_install 1 && apply && ok "内核与面板已更新" ;;
+      10) detect_addrs 0 ;;
+      11) ui_uninstall ;;
       0|q|Q) exit 0 ;;
       *) err "无效选择" ;;
     esac
@@ -956,6 +1387,19 @@ ${W}mnode v${VERSION}${N} — mihomo 节点搭建 / 删除 / 改端口 / 改 SNI
   mnode ip                       重新探测公网 IPv4/IPv6
   mnode restart | log | update | uninstall | version
 
+流量面板:
+  mnode panel                    面板地址与状态
+  mnode panel url                只输出带令牌的访问地址
+  mnode panel show               终端里看统计
+  mnode panel daily [天数]        每日流量（默认 14 天）
+  mnode panel port <端口>         改面板端口
+  mnode panel token              重置访问令牌
+  mnode panel local | public     仅本机访问 / 允许公网访问
+  mnode panel apply              重建 netfilter 计数规则
+  mnode panel selftest           统计自检
+  mnode panel reset              清空统计数据
+  mnode panel log                面板日志
+
 协议:
   vless-reality   VLESS + REALITY（免证书、抗封锁，首选）
   vless-ws        VLESS + WS 明文（套 CDN 用，SNI 即回源域名）
@@ -969,6 +1413,7 @@ ${W}mnode v${VERSION}${N} — mihomo 节点搭建 / 删除 / 改端口 / 改 SNI
 
 说明: 服务器有公网 IPv6 时，每个节点会额外输出一条 IPv6 链接（标签后缀 -v6）；
       没有 IPv6 则只输出 IPv4，不产生无效链接。
+      流量统计来自内核 netfilter 计数器（按节点端口计数，不抽样不估算）。
 EOF
 }
 
@@ -1002,8 +1447,69 @@ bootstrap() {
   core_install 0
   self_install
   svc_install
+  # 流量面板（缺 python3 或下载失败都只是跳过，不影响节点功能）
+  if panel_install 0; then
+    panel_ensure_conf
+    panel_svc_install
+    fw_open "$(panel_get port)"
+    panel_sync_nodes
+    panel_fw_apply
+    panel_start
+  fi
   [ -s "$ROOT/.ip4" ] || detect_addrs 0
   [ -f "$CONF" ] || build_conf
+}
+
+# mnode panel <子命令>
+cmd_panel() {
+  local sub="${1:-info}"; shift 2>/dev/null || true
+  if ! panel_installed; then
+    case "$sub" in
+      install|update)
+               panel_install 1 || return 1
+               panel_ensure_conf; panel_svc_install
+               fw_open "$(panel_get port)"; panel_refresh
+               ok "面板已安装并启动"; panel_info; return 0 ;;
+      *) err "流量面板未安装，执行 mnode panel install 安装"; return 1 ;;
+    esac
+  fi
+  case "$sub" in
+    ''|info|status) panel_info ;;
+    url)      panel_url ;;
+    show)     python3 "$PANEL_PY" show ;;
+    daily)    python3 "$PANEL_PY" daily "${1:-14}" ;;
+    apply)    panel_refresh && ok "计数规则已重建" ;;
+    selftest) python3 "$PANEL_PY" selftest ;;
+    reset)    python3 "$PANEL_PY" reset "${1:-}" >/dev/null 2>&1
+              panel_start; ok "统计已清空" ;;
+    log|logs) panel_log "${1:-50}" ;;
+    start)    panel_start && ok "面板已启动" ;;
+    stop)     panel_stop  && ok "面板已停止" ;;
+    restart)  panel_start && ok "面板已重启" ;;
+    install|update)
+              panel_install 1 || return 1
+              panel_ensure_conf; panel_svc_install; panel_refresh
+              ok "面板资源已更新" ;;
+    port)     [ $# -ge 1 ] || { err "用法: mnode panel port <端口>"; return 1; }
+              valid_port "$1" || { err "端口无效: $1"; return 1; }
+              port_used "$1" && { err "端口 $1 已被占用"; return 1; }
+              fw_close "$(panel_get port)"
+              panel_set port "$1"; fw_open "$1"; panel_start
+              ok "面板端口已改为 $1"; panel_info ;;
+    interval) [ $# -ge 1 ] || { err "用法: mnode panel interval <1-60>"; return 1; }
+              case "$1" in ''|*[!0-9]*) err "无效数值"; return 1 ;; esac
+              { [ "$1" -ge 1 ] && [ "$1" -le 60 ]; } || { err "范围 1-60"; return 1; }
+              panel_set interval "$1"; panel_start; ok "采集间隔已改为 ${1}s" ;;
+    token)    panel_set token "$(gen_hex 16)"; panel_start
+              ok "令牌已重置"; panel_url ;;
+    local)    panel_set listen "127.0.0.1"; fw_close "$(panel_get port)"
+              panel_start; ok "面板已限制为仅本机访问" ;;
+    public)   panel_set listen "0.0.0.0"; fw_open "$(panel_get port)"
+              panel_start; ok "面板已允许公网访问"; panel_url ;;
+    sync)     panel_sync_nodes && ok "节点表已同步" ;;
+    *) err "未知面板子命令: $sub"; return 1 ;;
+  esac
+  return 0
 }
 
 main() {
@@ -1033,9 +1539,10 @@ main() {
           nexists "$1" || { err "节点不存在: $1"; return 1; }
           show_qr "$(link "$1" "$(addr4)")" ;;
     ip|addr) detect_addrs 0 ;;
+    panel)   cmd_panel "$@" ;;
     restart|apply) apply && ok "服务已重启" ;;
     log|logs) svc_log 50 ;;
-    update) core_install 1 && apply && ok "内核已更新" ;;
+    update) core_install 1 && panel_install 1; apply && ok "内核与面板已更新" ;;
     uninstall) ui_uninstall ;;
     menu) menu ;;
     *) err "未知命令: $cmd"; usage; return 1 ;;
